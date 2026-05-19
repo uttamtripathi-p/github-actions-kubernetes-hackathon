@@ -79,6 +79,7 @@ func main() {
 
 	// Health check
 	router.GET("/health", handlers.HealthCheck)
+	router.POST("/api/ai/chat", handlers.AskAI)
 
 	port := os.Getenv("PORT")
 	if port == "" {

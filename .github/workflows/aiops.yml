@@ -1,0 +1,83 @@
+name: AIOps Log Analysis
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  analyze-logs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Start EC2 and fetch IP
+        id: ec2
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text --region ap-south-1)
+
+          if [ "$STATE" != "running" ]; then
+            aws ec2 start-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID }} --region ap-south-1
+            aws ec2 wait instance-status-ok --instance-ids ${{ secrets.EC2_INSTANCE_ID }} --region ap-south-1
+          fi
+
+          IP=$(aws ec2 describe-addresses \
+            --filters "Name=instance-id,Values=${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Addresses[0].PublicIp" \
+            --output text --region ap-south-1)
+          echo "IP=$IP" >> $GITHUB_OUTPUT
+
+      - name: Fetch and analyze logs
+        id: analysis
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ steps.ec2.outputs.IP }} >> ~/.ssh/known_hosts
+
+          LOGS=$(ssh -i ~/.ssh/id_ed25519 ubuntu@${{ steps.ec2.outputs.IP }} \
+            "cd ~/github-actions-kubernetes-hackathon && docker compose logs --tail=30 2>&1")
+
+          STATS=$(ssh -i ~/.ssh/id_ed25519 ubuntu@${{ steps.ec2.outputs.IP }} \
+            "docker stats --no-stream 2>&1")
+
+          PROMPT="You are a DevOps AI assistant. Analyze these Docker logs and stats for SkillPulse app. Find errors, warnings, performance issues and give recommendations.\n\nLOGS:\n${LOGS}\n\nSTATS:\n${STATS}"
+
+          RESPONSE=$(curl -s -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"contents\":[{\"parts\":[{\"text\":\"$(echo "$PROMPT" | tr '\n' ' ' | sed 's/"/\\"/g')\"}]}]}")
+
+          ANALYSIS=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print(data['candidates'][0]['content']['parts'][0]['text'])
+          ")
+
+          echo "ANALYSIS<<EOF" >> $GITHUB_OUTPUT
+          echo "$ANALYSIS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const analysis = `${{ steps.analysis.outputs.ANALYSIS }}`;
+            const date = new Date().toISOString().split('T')[0];
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🤖 AIOps Analysis - ${date}`,
+              body: `## Automated Log Analysis by Gemini AI\n\n${analysis}\n\n---\n*Auto-generated every 6 hours*`,
+              labels: ['aiops', 'automated']
+            });
